@@ -1,0 +1,332 @@
+# ============================================================================
+# AGENTS MANIFEST - canonical registry of the NXP Edge AI Governance Harness
+# ============================================================================
+# Version: 1.0 | Date: 2026-06-11 | Maintainer: Governance Committee (GC)
+#
+# THIS FILE IS THE SINGLE SOURCE OF TRUTH for the agent roster.
+# The design docs drifted (DataCurator/DataCustodian, Quantizer/
+# QuantizationGatekeeper, "nine agents" vs ten rows). Canonical names below;
+# prior names are recorded as aliases. Counting rule:
+#   "Nine agents" = 1 Orchestrator + 8 stage workers (S0-S7).
+#   PipelineAssembler (S8) is OPTIONAL (GenAI/Agentic projects only).
+#   GovernanceKernel is INFRASTRUCTURE, not an agent (alias: "Policy Engine").
+#
+# Schema per agent:
+#   id, status(active|optional|proposed), stage, gate(none|hard), mission,
+#   aliases, raci{accountable,responsible}, a2a{accepts,emits},
+#   mcp_tools[{tool,scope}], skills, data{reads,writes},
+#   guardrails{inbound,outbound,blocks}, controls_owned
+# ============================================================================
+
+manifest_version: "1.0"
+source_design: "../2026-06-01-agentic-harness-design.md"
+
+# ---------------------------------------------------------------------------
+# INFRASTRUCTURE (not agents - no LLM, no A2A identity of their own)
+# ---------------------------------------------------------------------------
+infrastructure:
+  governance_kernel:
+    aliases: ["Policy Engine"]
+    components:
+      - policy_evaluator      # (action, context) -> ALLOW|BLOCK|REQUIRE_EVIDENCE|REQUIRE_APPROVAL (Rego/OPA)
+      - manifest_ledger       # governance-manifest.yaml, Git-versioned; KERNEL IS THE ONLY WRITER
+      - hook_library          # every ex-02 hook as a typed MCP tool + Rego policy
+      - stage_state_machine   # L1->L7 ordering; gates refuse advance on non-complete predecessor
+      - audit_log             # append-only hash-chained JSONL (governance/audit/YYYY-MM-DD.jsonl)
+    exclusive_mcp_tools:
+      - { tool: manifest.write, scope: kernel_only }
+
+# ---------------------------------------------------------------------------
+# GLOBAL GUARDRAILS (every agent, every A2A call)
+# ---------------------------------------------------------------------------
+global_guardrails:
+  inbound:
+    - id: G-IN-1
+      check: "A2A envelope manifest_ref == HEAD of governance-manifest.yaml"
+      on_fail: "ManifestStale -> re-read manifest, re-evaluate policy"
+    - id: G-IN-2
+      check: "caller is in agents_authorized for every MCP tool requested"
+      on_fail: "UnauthorizedCaller -> tamper alert to Orchestrator"
+    - id: G-IN-3
+      check: "policy.lock version matches worker's pinned policy bundle"
+      on_fail: "PolicyVersionMismatch -> refuse until reconciled"
+  outbound:
+    - id: G-OUT-1
+      check: "policy.evaluate called BEFORE any side effect"
+      on_fail: "BLOCK -> abort action, emit BlockedByPolicy + remediation hint"
+    - id: G-OUT-2
+      check: "manifest writes go through the Kernel (worker emits proposed delta only)"
+      on_fail: "delta rejected; direct writes detected as ManifestTampered"
+
+# ---------------------------------------------------------------------------
+# AGENTS
+# ---------------------------------------------------------------------------
+agents:
+
+  - id: orchestrator
+    status: active
+    stage: cross-stage
+    gate: none
+    mission: "Translate project intent into the 8-stage eIQ plan, dispatch workers, gate stage transitions, surface the manifest to the user."
+    aliases: []
+    raci: { accountable: AIPO, responsible: Orchestrator }
+    a2a:
+      accepts: [project.intent, evidence.submit, gate.approve, gate.reject, worker.report]
+      emits:   [plan.created, stage.dispatched, gate.request, manifest.updated, project.complete]
+    mcp_tools:
+      - { tool: manifest.read,   scope: read }
+      - { tool: policy.evaluate, scope: evaluate }
+      - { tool: a2a.dispatch,    scope: dispatch }
+      - { tool: notify.user,     scope: user_io }
+    skills: [intent_decomposition, stage_planning, gate_management, manifest_surfacing]
+    data:
+      reads:  [governance-manifest.yaml, L1 Decision Record]
+      writes: [project plan (via Kernel delta)]
+    guardrails:
+      inbound:
+        - "project.intent carries use case, autonomy level, EU AI Act class hints"
+        - "governance-manifest.yaml exists and is schema-valid"
+        - "AIPO sign-off present on the L1 Decision Record"
+      outbound:
+        - "every dispatch carries a fresh manifest_ref"
+        - "manifest re-snapshotted on every stage transition"
+        - "user notified on every gate.request and manifest.updated"
+      blocks:
+        - "any 🔴 control in the previous stage not complete"
+        - "gate.request rejected by the user"
+        - "unremediated BlockedByPolicy from any worker"
+        - "manifest fails schema validation"
+    controls_owned: [cross-stage manifest integrity]
+    notes: "ONLY agent that talks to the user. Only agent allowed to call stage.advance (governed by the Kernel state machine)."
+
+  - id: environment-steward
+    status: active
+    stage: S0
+    gate: none
+    mission: "Provision a governed eIQ baseline: pinned toolchain, AI Hub workspace, RBAC, CVE feed, scaffolded governance/ tree."
+    aliases: []
+    raci: { accountable: DSL, responsible: EnvironmentSteward }
+    a2a: { accepts: [env.provision], emits: [env.provisioned] }
+    mcp_tools:
+      - { tool: eiq_hub.workspace.create, scope: action }
+      - { tool: eiq_toolkit.pin_version,  scope: action }
+      - { tool: rbac.assign_role,         scope: action }
+      - { tool: git.repo.init,            scope: action }
+      - { tool: cve_feed.subscribe,       scope: action }
+    skills: [toolchain_pinning, workspace_provisioning, rbac_setup, cve_monitoring]
+    data:
+      reads:  [supported hardware list, role vocabulary]
+      writes: [eiq-toolchain.lock, governance-roles.yaml, governance/ scaffold, manifest init (all L1 controls pending)]
+    guardrails:
+      inbound:  ["caller has DSL or AIPO role", "workspace name does not collide", "target NXP hardware family supported"]
+      outbound: ["toolchain versions recorded", "governance/ tree from canonical template", "CVE feed subscription live"]
+      blocks:   ["lock file exists without force", "RBAC names off-vocabulary", "CVE feed unreachable", "AI Hub quota exceeded"]
+    controls_owned: [DG-01, SR-01, RC-01, HO-01 prerequisites]
+    notes: "Emits env.vulnerable mid-project on critical CVE -> Orchestrator pauses project (SR-03)."
+
+  - id: data-curator
+    status: active
+    stage: S1
+    gate: none
+    mission: "Wrap eIQ Dataset Curator: datasheet enforcement, PII/biometric scan, representativeness report, DPIA gate."
+    aliases: [DataCustodian]
+    raci: { accountable: DPO, responsible: DataCurator }
+    a2a: { accepts: [dataset.import], emits: [dataset.cleared, dataset.blocked] }
+    mcp_tools:
+      - { tool: eiq_portal.dataset.import,  scope: action }
+      - { tool: pii_scanner.scan,           scope: scan }
+      - { tool: governance.write_datasheet, scope: evidence }
+      - { tool: dpia.check_signature,       scope: gate }
+    skills: [datasheet_authoring, pii_detection, representativeness_analysis, dpia_gating]
+    data:
+      reads:  [license allow-list, DPIA registry]
+      writes: [governance/data/datasheet-<id>.yaml, PII report, representativeness report]
+    guardrails:
+      inbound:  ["caller has MRO or DPO role", "datasheet template fields complete", "PII scan < 7 days old", "DPIA path provided when contains_pii"]
+      outbound: ["datasheet written", "representativeness report written", "DG-02/DG-04/FB-02/DP-01 updated", "requires_dpia propagated"]
+      blocks:   ["license not in allow-list", "biometric PII without signed DPIA", "datasheet fields missing", "class < 1% AND safety function"]
+    controls_owned: [DG-02, DG-03, DG-04, DP-01, DP-03, FB-02]
+
+  - id: model-registrar
+    status: active
+    stage: S2
+    gate: none
+    mission: "Wrap Model Zoo / BYOM: registry entry, SBOM, license + EU AI Act class check."
+    aliases: []
+    raci: { accountable: MRO, responsible: ModelRegistrar }
+    a2a: { accepts: [model.select], emits: [model.registered, model.blocked] }
+    mcp_tools:
+      - { tool: model_zoo.fetch,         scope: action }
+      - { tool: byom.import,             scope: action }
+      - { tool: sbom.generate,           scope: evidence }
+      - { tool: license.check_allowlist, scope: gate }
+      - { tool: eu_ai_act.classify_use,  scope: gate }
+    skills: [model_registry, sbom_generation, license_compliance, risk_classification]
+    data:
+      reads:  [prohibited-use registry, license allow-list, CVE database]
+      writes: [governance/model-registry.yaml, governance/sbom-<id>.json]
+    guardrails:
+      inbound:  ["Zoo: model_id given | BYOM: source_url + sha256 + license given", "intended use provided"]
+      outbound: ["registry entry written", "SBOM written (SR-04)", "ML-01/LM-01/SR-04/EU-02 updated", "license compatibility recorded"]
+      blocks:   ["BYOM sha256 mismatch", "non-commercial license for commercial use", "use on prohibited registry", "unpatched critical CVE in SBOM"]
+    controls_owned: [ML-01, LM-01, SR-04, SR-05, EU-02]
+
+  - id: trainer
+    status: active
+    stage: S3
+    gate: none
+    mission: "Wrap eIQ Trainer: DPIA gate enforcement, full run-log capture, model-card draft."
+    aliases: []
+    raci: { accountable: MRO, responsible: Trainer }
+    a2a: { accepts: [train.run], emits: [train.completed] }
+    mcp_tools:
+      - { tool: eiq_portal.train,           scope: action }
+      - { tool: manifest.read,              scope: gate }   # DPIA check
+      - { tool: model_card.draft,           scope: evidence }
+      - { tool: artifact.stamp_fingerprint, scope: evidence }
+    skills: [training_execution, reproducibility_capture, model_card_drafting]
+    data:
+      reads:  [dataset registry, model registry, DP-01 status]
+      writes: [governance/training-runs/run-NNN.yaml, governance/model-cards/<model>.md]
+    guardrails:
+      inbound:  ["caller has MRO role", "dataset and model in manifest", "DP-01 complete for the dataset", "seed provided", "hardware target set"]
+      outbound: ["run log with dataset hash + seed + toolchain fingerprint + artifact hash", "model card draft written", "ML-03/04, FB-04, DG-07, EU-05, FS-04, XT-02 updated"]
+      blocks:   ["DP-01 not complete (NON-BYPASSABLE)", "reproducibility metadata missing", "framework has unpatched critical CVE", "model not in registry"]
+    controls_owned: [ML-03, ML-04, FB-04, DG-07, EU-05, FS-04, XT-02]
+
+  - id: quantization-gatekeeper
+    status: active
+    stage: S4
+    gate: hard            # HARD GATE 1: L4 -> L5
+    mission: "Wrap Neutron Converter with three MANDATORY regressions: general accuracy, safety vectors, subgroup fairness. Non-zero exit on any failure."
+    aliases: [Quantizer]
+    raci: { accountable: MRO, responsible: QuantizationGatekeeper }
+    a2a: { accepts: [quantize.run], emits: [quantize.passed, quantize.blocked] }
+    mcp_tools:
+      - { tool: neutron_converter.invoke, scope: action_with_quantization_gate }
+      - { tool: eval.run_general,         scope: gate }
+      - { tool: eval.run_safety,          scope: gate }
+      - { tool: eval.run_subgroup,        scope: gate }
+      - { tool: report.write,             scope: evidence }
+    skills: [int8_int4_conversion, accuracy_regression, safety_vector_testing, fairness_regression]
+    data:
+      reads:  [signed training artifact, calibration set, general/safety/subgroup test sets]
+      writes: [governance/reports/quant-regression-<model>.md, quantization config in model card, signed converted artifact (PASS only)]
+    guardrails:
+      inbound:  ["caller is the Orchestrator (never a user)", "training artifact exists and is signed", "all three test sets non-empty", "target NPU specified", "calibration set provided"]
+      outbound: ["three pass/fail rows in report", "quant config recorded", "ML-05/06/07, FB-06, FS-05, ES-03 updated"]
+      blocks:   ["general_drop > 2%", "safety_discrepancies > 0", "subgroup_disp > 2%", "safety test set empty", "calibration set missing", "NPU unsupported"]
+    controls_owned: [ML-05, ML-06, ML-07, FB-06, FS-05, ES-03]
+    notes: "The 'if you can only do one thing' hook. Regressions are mandatory, not configurable."
+
+  - id: validator
+    status: active
+    stage: S5
+    gate: none
+    mission: "Wrap eIQ Validate: subgroup confusion matrices, adversarial probes (FGSM/PGD/garak), explainability validation, FSE sign-off gate for safety functions."
+    aliases: []
+    raci: { accountable: MRO, responsible: Validator, signoff: FSE (sil >= 1) }
+    a2a: { accepts: [validate.run], emits: [validate.passed, validate.blocked] }
+    mcp_tools:
+      - { tool: eiq_portal.validate,  scope: action }
+      - { tool: fgsm.run,             scope: probe }
+      - { tool: pgd.run,              scope: probe }
+      - { tool: garak.run,            scope: probe }   # LLM prompt-injection suite
+      - { tool: shap.compute,         scope: evidence }
+      - { tool: fse.request_signoff,  scope: approval }
+    skills: [subgroup_validation, adversarial_probing, prompt_injection_testing, xai_validation, safety_signoff_routing]
+    data:
+      reads:  [quantized artifact, test sets, FS-04 status]
+      writes: [governance/reports/validation-<model>.md, adversarial/prompt-injection registry]
+    guardrails:
+      inbound:  ["caller has MRO role (FSE for safety review)", "quantized artifact exists", "test sets present", "safety: FS-04 complete"]
+      outbound: ["per-subgroup confusion matrix written", "SR-06/07/08, FB-04/07, LM-06/08, XT-04/05, FS-07/08/09, HO-03/04 updated", "FSE sign-off row for safety functions"]
+      blocks:   ["subgroup disparity over threshold", "successful prompt injection", "sil >= 1 without FSE sign-off", "test set older than artifact"]
+    controls_owned: [SR-06, SR-07, SR-08, FB-04, FB-07, LM-06, LM-08, XT-04, XT-05, FS-07, FS-08, FS-09, HO-03, HO-04]
+
+  - id: profiler
+    status: active
+    stage: S6
+    gate: none
+    mission: "On-device profiling: latency/memory/power capture, power-budget assertion, determinism check (N=10) for safety functions."
+    aliases: []
+    raci: { accountable: MRO, responsible: Profiler, signoff: FSE (determinism) }
+    a2a: { accepts: [profile.run], emits: [profile.passed, profile.blocked] }
+    mcp_tools:
+      - { tool: eiq_target.profile,    scope: action }
+      - { tool: power.assert_budget,   scope: gate }
+      - { tool: determinism.check,     scope: gate }   # 10x same input
+    skills: [hardware_profiling, power_budget_assertion, determinism_testing]
+    data:
+      reads:  [validated artifact, L1 power budget (ES-01), registered device set]
+      writes: [governance/reports/profiling-<model>.json, governance/reports/determinism-<model>.json]
+    guardrails:
+      inbound:  ["validated artifact exists", "target hardware registered + available", "power budget set in ES-01", "is_safety_function flag set when required"]
+      outbound: ["latency p50/p95/p99 + peak memory + NPU power recorded", "determinism variance vs SIL threshold recorded", "ES-03, FS-06, ML-09 updated"]
+      blocks:   ["power exceeds L1 budget", "determinism variance over SIL threshold", "peak memory over target budget", "hardware not in registered set"]
+    controls_owned: [ES-03, FS-06, ML-09]
+
+  - id: deployment-gatekeeper
+    status: active
+    stage: S7
+    gate: hard            # HARD GATE 2: L6 -> L7
+    mission: "Wrap export-to-inference-engine. THE ONLY AGENT that may emit a signed deployable artifact. Refuses unless every L1-L5 critical control is complete; 4-party authorization for safety-critical."
+    aliases: [Deployer]
+    raci: { accountable: DSL, responsible: DeploymentGatekeeper, signoff: "AIPO+MRO+DSL+FSE (safety-critical)" }
+    a2a: { accepts: [deploy.export], emits: [deploy.signed, deploy.blocked] }
+    mcp_tools:
+      - { tool: eiq_export.run,          scope: action }
+      - { tool: manifest.read,           scope: gate }
+      - { tool: policy.evaluate_gate,    scope: gate }
+      - { tool: artifact.sign,           scope: sign_exclusive }   # no other agent has this tool
+      - { tool: fleet.register_version,  scope: action }
+    skills: [gate_evaluation, artifact_signing, fleet_registration, multi_party_authorization]
+    data:
+      reads:  [full manifest (all L1-L5 controls), deployment authorization form, 4-party sign-off rows]
+      writes: [signed artifact (fleet signing key, SR-09), governance/deployment-auth-<version>.md, per-device version registry]
+    guardrails:
+      inbound:  ["caller is the Orchestrator", "all L1-L5 🔴 controls complete", "deployment authorization form committed", "safety: 4 sign-off rows present"]
+      outbound: ["artifact signed", "deployment auth written (ML-10/11)", "per-device registration (ML-12)", "ML-10/11/12, SR-09, HO-05/06 updated", "on gate FAIL: unsigned test artifact AT MOST"]
+      blocks:   ["ANY L1-L5 🔴 control not complete", "authorization form missing/unsigned", "safety: any of 4 sign-offs missing", "kill-switch test (HO-05) not passed"]
+    controls_owned: [ML-10, ML-11, ML-12, SR-09, HO-05, HO-06]
+
+  - id: pipeline-assembler
+    status: optional      # GenAI / Agentic AI Framework projects only
+    stage: S8
+    gate: none
+    mission: "Assemble GenAI Flow / Agentic pipelines with MCP tool registry and A2A graph governance; autonomy classification; prohibited-decisions check."
+    aliases: []
+    raci: { accountable: AIPO, responsible: PipelineAssembler }
+    a2a: { accepts: [pipeline.assemble], emits: [pipeline.assembled] }
+    mcp_tools:
+      - { tool: genai_flow.compose,        scope: action }
+      - { tool: agentic_framework.deploy,  scope: action }
+      - { tool: mcp_registry.write,        scope: evidence }
+      - { tool: a2a_graph.write,           scope: evidence }
+      - { tool: autonomy.classify,         scope: gate }
+    skills: [pipeline_composition, mcp_registry_governance, a2a_graph_governance, autonomy_classification]
+    data:
+      reads:  [corpus curation policy, prohibited-decisions registry]
+      writes: [governance/agentic/mcp-tool-registry.yaml, governance/agentic/a2a-graph.yaml]
+    guardrails:
+      inbound:  ["caller has AIPO role", "corpus curation policy exists", "registry + graph schemas valid", "autonomy level classified"]
+      outbound: ["registry + graph written", "LM-14, HO-01/02, EU-10, FS-12, DG-09/10/11 updated", "prohibited-decisions check passed"]
+      blocks:   ["tool not in MCP registry with scope + agents_authorized", "A2A edge without explicit authority", "scope:prohibited tool invoked", "expired RAG documents", "autonomy classification missing"]
+    controls_owned: [LM-14, HO-01, HO-02, EU-10, FS-12, DG-09, DG-10, DG-11]
+
+  # --------------------------------------------------------------------------
+  # PROPOSED (roadmap - closes the L7/L8 ownership gap; NOT yet in the design)
+  # --------------------------------------------------------------------------
+  - id: safety-adjudicator
+    status: proposed
+    stage: runtime (L7)
+    gate: none
+    mission: "Runtime adjudication of consequential actions against HARA, SIL, PAD and autonomy level (from the 2026-06-02 matrix doc; not yet integrated into the harness design)."
+    rationale: "Matrix doc row 8. Required before any L3-autonomy deployment (ex-03 BuildingSafe pattern)."
+
+  - id: fleet-monitor
+    status: proposed
+    stage: L7-L8
+    gate: none
+    mission: "Post-market monitoring: drift detection, telemetry governance, incident response (EU AI Act Art. 72/73 -> ML-13/14/15, RC-09), retirement orchestration (DG-12, DP-10, ML-16/17)."
+    rationale: "Closes the unowned-L7/L8 gap: the compliance matrix maps Art. 72/73 to controls no active agent owns."
